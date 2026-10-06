@@ -271,6 +271,39 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
+def _infer_dflash_block_size(cfg) -> int:
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+    model_override_args = json.loads(cfg.json_model_override_args)
+    inferred_block_size = None
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+        inferred_block_size = parse_dflash_draft_config(
+            draft_hf_config=draft_hf_config
+        ).resolve_block_size(default=None)
+    except Exception as e:
+        logger.warning(
+            "Failed to infer DFLASH block_size from draft model config; "
+            "defaulting speculative_dflash_block_size to 16. Error: %s",
+            e,
+        )
+
+    if inferred_block_size is None:
+        inferred_block_size = 16
+        logger.warning(
+            "speculative_dflash_block_size is not set; defaulting to %d for DFLASH.",
+            inferred_block_size,
+        )
+    return int(inferred_block_size)
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -308,7 +341,8 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
     #
-    # For DFlash, the natural unit is `block_size` (verify window length).
+    # For DFlash, the units are the draft block (what the draft model fills)
+    # and the verify width (how much of it the target scores).
     if cfg.speculative_num_steps is None:
         declare_resolution(
             server_args,
@@ -343,72 +377,58 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_eagle_topk=1,
         )
 
-    if cfg.speculative_dflash_block_size is not None:
-        if int(cfg.speculative_dflash_block_size) <= 0:
-            raise ValueError(
-                "DFLASH requires --speculative-dflash-block-size to be positive, "
-                f"got {cfg.speculative_dflash_block_size}."
-            )
-        if cfg.speculative_num_draft_tokens is not None and int(
-            cfg.speculative_num_draft_tokens
-        ) != int(cfg.speculative_dflash_block_size):
-            raise ValueError(
-                "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                "but they differ. For DFLASH they must match. "
-                f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}, "
-                f"speculative_dflash_block_size={cfg.speculative_dflash_block_size}."
-            )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_draft_tokens=int(cfg.speculative_dflash_block_size),
+    # --speculative-dflash-block-size and --speculative-num-draft-tokens both
+    # name the draft block (the width the checkpoint was trained to fill).
+    draft_block_size = cfg.speculative_dflash_block_size
+    if draft_block_size is None:
+        draft_block_size = cfg.speculative_num_draft_tokens
+    elif cfg.speculative_num_draft_tokens is not None and int(
+        cfg.speculative_num_draft_tokens
+    ) != int(draft_block_size):
+        raise ValueError(
+            "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+            "but they differ. For DFLASH they must match. "
+            f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}, "
+            f"speculative_dflash_block_size={draft_block_size}."
+        )
+    if draft_block_size is None:
+        draft_block_size = _infer_dflash_block_size(cfg)
+    draft_block_size = int(draft_block_size)
+    if draft_block_size <= 0:
+        raise ValueError(
+            "DFLASH requires --speculative-dflash-block-size to be positive, "
+            f"got {draft_block_size}."
         )
 
-    if cfg.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dflash_utils import (
-            parse_dflash_draft_config,
+    # The target may verify only the leading tokens of each drafted block, so a
+    # block whose tail rarely survives verify need not be scored in full.
+    num_verify_tokens = (
+        draft_block_size
+        if cfg.speculative_dflash_num_verify_tokens is None
+        else int(cfg.speculative_dflash_num_verify_tokens)
+    )
+    if not 1 <= num_verify_tokens <= draft_block_size:
+        raise ValueError(
+            "DFLASH requires 1 <= --speculative-dflash-num-verify-tokens "
+            "<= --speculative-dflash-block-size. "
+            f"speculative_dflash_num_verify_tokens={num_verify_tokens}, "
+            f"speculative_dflash_block_size={draft_block_size}."
         )
-
-        model_override_args = json.loads(cfg.json_model_override_args)
-        inferred_block_size = None
-        try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            inferred_block_size = parse_dflash_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_block_size(default=None)
-        except Exception as e:
-            logger.warning(
-                "Failed to infer DFLASH block_size from draft model config; "
-                "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                e,
-            )
-
-        if inferred_block_size is None:
-            inferred_block_size = 16
-            logger.warning(
-                "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                inferred_block_size,
-            )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_draft_tokens=inferred_block_size,
-        )
+    declare_resolution(
+        server_args,
+        "_handle_dflash",
+        speculative_dflash_block_size=draft_block_size,
+        speculative_dflash_num_verify_tokens=num_verify_tokens,
+        # Target-side consumers read the verify width through this field.
+        speculative_num_draft_tokens=num_verify_tokens,
+    )
 
     if cfg.speculative_draft_window_size is not None:
-        draft_tokens = int(cfg.speculative_num_draft_tokens)
-        if cfg.speculative_draft_window_size < draft_tokens:
+        if cfg.speculative_draft_window_size < draft_block_size:
             raise ValueError(
                 "--speculative-draft-window-size must be >= "
-                "--speculative-num-draft-tokens (block_size). "
-                f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
+                "--speculative-dflash-block-size. "
+                f"window_size={cfg.speculative_draft_window_size}, draft_block_size={draft_block_size}."
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
