@@ -138,12 +138,12 @@ class _DflashDraftSampler:
         self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
     ):
         self.weight = weight
-        self.block_size = int(block_size)
+        self.draft_block_size = int(block_size)
         self.num_org = int(num_org)
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        max_tokens = int(max_bs) * (self.draft_block_size - 1)
         device = weight.device
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
         if self.tp_size > 1:
@@ -169,8 +169,8 @@ class _DflashDraftSampler:
 
     def __call__(self, hidden_states, input_ids=None):
         # draft tokens are block positions 1: (pos 0 is the seeded bonus token)
-        bs = hidden_states.shape[0] // self.block_size
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :].reshape(
+        bs = hidden_states.shape[0] // self.draft_block_size
+        hs = hidden_states.view(bs, self.draft_block_size, -1)[:, 1:, :].reshape(
             -1, hidden_states.shape[-1]
         )
         if hs.dtype != self.weight.dtype:
@@ -251,9 +251,13 @@ class _SelectorDraftSampler:
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
-        self.block_size = int(block_size)
+        self.draft_block_size = int(block_size)
         self.sampling_enabled = sampling_enabled
-        max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
+        max_bs, gamma, top_k = (
+            int(max_bs),
+            self.draft_block_size - 1,
+            self.selector.top_k,
+        )
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
         # baked into the captured graph.
@@ -286,9 +290,11 @@ class _SelectorDraftSampler:
         )
 
     def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.block_size
-        block_ids = input_ids.view(bs, self.block_size)
-        hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
+        bs = hidden_states.shape[0] // self.draft_block_size
+        block_ids = input_ids.view(bs, self.draft_block_size)
+        hs = hidden_states.view(bs, self.draft_block_size, -1)[
+            :, 1:, :
+        ]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
         # In-graph philox draw: each replay advances the generator and redraws.
         tokens, q_rows = self.selector.sample_path(
@@ -328,14 +334,14 @@ class _DominoDraftSampler:
         self.prefix_gru = prefix_gru
         self.embed_proj = embed_proj
         self.vocab_size = int(vocab_size)
-        self.block_size = int(block_size)
+        self.draft_block_size = int(block_size)
         self.shift_label = bool(shift_label)
         self.candidate_pool_size = int(candidate_pool_size)
         self.tp_group = tp_group
         self.lm_head_org_vocab_start = int(lm_head_org_vocab_start)
         self.lm_head_num_org = lm_head_num_org
         self.lm_head_num_org_padded = lm_head_num_org_padded
-        max_tokens = int(max_bs) * (self.block_size - 1)
+        max_tokens = int(max_bs) * (self.draft_block_size - 1)
         self.out = torch.empty(
             (max_tokens,), dtype=torch.int64, device=lm_head_weight.device
         )
@@ -343,9 +349,9 @@ class _DominoDraftSampler:
     def __call__(self, hidden_states, input_ids=None):
         if input_ids is None:
             raise RuntimeError("Domino draft sampler requires block input_ids.")
-        bs = hidden_states.shape[0] // self.block_size
-        draft_hidden = hidden_states.view(bs, self.block_size, -1)
-        bonus_tokens = input_ids.view(bs, self.block_size)[:, 0]
+        bs = hidden_states.shape[0] // self.draft_block_size
+        draft_hidden = hidden_states.view(bs, self.draft_block_size, -1)
+        bonus_tokens = input_ids.view(bs, self.draft_block_size)[:, 0]
         proposals = domino_greedy_rollout(
             draft_hidden=draft_hidden,
             bonus_tokens=bonus_tokens,
@@ -362,7 +368,7 @@ class _DominoDraftSampler:
             lm_head_num_org_padded=self.lm_head_num_org_padded,
             prefer_tp_candidate_pool=bs > 1,
         )
-        self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
+        self.out[: bs * (self.draft_block_size - 1)].copy_(proposals.reshape(-1))
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -466,23 +472,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
             )
-        self.block_size = int(get_spec().speculative_dflash_block_size)
+        self.draft_block_size = int(get_spec().speculative_dflash_block_size)
         model_block_size = draft_config.block_size
         if model_block_size is None:
             model_block_size = getattr(self.draft_model, "block_size", None)
-        if model_block_size is not None and int(model_block_size) != self.block_size:
+        if (
+            model_block_size is not None
+            and int(model_block_size) != self.draft_block_size
+        ):
             logger.warning(
                 "DFLASH block size mismatch: using speculative_dflash_block_size=%s but draft config block_size=%s.",
-                self.block_size,
+                self.draft_block_size,
                 model_block_size,
             )
-        self.draft_model.set_block_size(self.block_size)
+        self.draft_model.set_block_size(self.draft_block_size)
         # The target verifies only the leading tokens of each drafted block.
-        self.speculative_num_draft_tokens = int(get_spec().speculative_num_draft_tokens)
-        if self._is_domino and self.block_size <= 1:
+        self.num_verify_tokens = int(get_spec().speculative_num_draft_tokens)
+        if self._is_domino and self.draft_block_size <= 1:
             raise ValueError(
-                "DFLASH Domino requires speculative_num_draft_tokens > 1, "
-                f"got {self.block_size}."
+                "DFLASH Domino requires --speculative-dflash-block-size > 1, "
+                f"got {self.draft_block_size}."
             )
 
         self._mask_token = draft_config.mask_token
@@ -504,7 +513,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
-                self.block_size,
+                self.draft_block_size,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
@@ -523,7 +532,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         self._block_pos_offsets = build_block_pos_offsets(
-            length=self.block_size, device=self.device
+            length=self.draft_block_size, device=self.device
         )
         self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
@@ -539,7 +548,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.block_size), device=self.device
+            draft_token_num=int(self.draft_block_size), device=self.device
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -707,9 +716,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not is_cuda() or not is_dflash_sampling_verify_available():
             return self.model_runner.prewarm_sampling()
 
-        block_size = int(self.speculative_num_draft_tokens)
+        num_verify_tokens = int(self.num_verify_tokens)
         vocab_size = self.model_config.vocab_size
-        bs = self._prewarm_batch_size(block_size)
+        bs = self._prewarm_batch_size(num_verify_tokens)
         device = self.device
 
         sampling_info = SamplingBatchInfo(
@@ -726,15 +735,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             need_min_p_sampling=False,
             vocab_size=vocab_size,
         )
-        candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
+        candidates = torch.zeros(
+            (bs, num_verify_tokens), dtype=torch.int64, device=device
+        )
         target_logits = torch.zeros(
-            (bs * block_size, vocab_size), dtype=torch.float32, device=device
+            (bs * num_verify_tokens, vocab_size), dtype=torch.float32, device=device
         )
 
         # Size the process-lifetime chain buffers before anything borrows. The
         # cache is keyed on device index, so pass the resolved device, not "cuda".
         _get_or_create_chain_verify_buffers(
-            bs=bs, draft_token_num=block_size, device=target_logits.device
+            bs=bs, draft_token_num=num_verify_tokens, device=target_logits.device
         )
         # One unborrowed pass, so any workspace a kernel caches for the process
         # lifetime lands outside graph storage and off the measured peak.
@@ -757,7 +768,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise
             reason = (
                 "DFLASH sampling rehearsal exhausted graph-pool memory for the "
-                f"{bs}x{block_size}x{vocab_size} verify probability matrices"
+                f"{bs}x{num_verify_tokens}x{vocab_size} verify probability matrices"
             )
             logger.warning(
                 "Graph pool %s; disabling borrowing and reserving the measured "
@@ -794,7 +805,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
-        if self.block_size <= 1:
+        if self.draft_block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
@@ -822,7 +833,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
-                block_size=self.block_size,
+                block_size=self.draft_block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
@@ -836,7 +847,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_model=self.draft_model,
                 embed_tokens=target_input_embeddings(target_model),
                 lm_head=lm_head,
-                block_size=self.block_size,
+                block_size=self.draft_block_size,
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
@@ -861,7 +872,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
                 vocab_size=int(self.model_runner.model_config.vocab_size),
-                block_size=self.block_size,
+                block_size=self.draft_block_size,
                 shift_label=self.draft_model.shift_label,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 candidate_pool_size=self.domino_candidate_pool_size,
@@ -895,7 +906,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         return _DflashDraftSampler(
             weight=lm_head.weight,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -977,7 +988,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 head_dim=first_attn.head_dim,
                 device=self.device,
                 max_position_hint=self.target_worker.model_runner.model_config.context_len
-                + int(self.block_size),
+                + int(self.draft_block_size),
             )
             if get_parallel().tp_rank == 0:
                 logger.info(
@@ -1006,7 +1017,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
         device = self.device
-        block_size = int(self.block_size)
+        block_size = int(self.draft_block_size)
         self._draft_block_ids_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
@@ -1414,7 +1425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
             raise RuntimeError("DFLASH selector draft returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        draft_hidden = draft_hidden.view(bs, int(self.draft_block_size), -1)
         pred_hidden = draft_hidden[:, 1:, :]  # [bs, block_size-1, H]
         num_pred = pred_hidden.shape[1]
 
@@ -1478,7 +1489,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
                 gamma=gamma,
-                verify_num_draft_tokens=block,
+                num_verify_tokens=block,
                 cutoff_verify_lens=None,
             )
         finally:
@@ -2065,7 +2076,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         )
         device = self.device
-        verify_num_draft_tokens = int(self.speculative_num_draft_tokens)
+        num_verify_tokens = int(self.num_verify_tokens)
         self._accept_len_buf = torch.empty((new_cap,), dtype=torch.int32, device=device)
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
@@ -2075,9 +2086,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.empty((new_cap,), dtype=torch.int64, device=device) for _ in range(2)
         ]
         self._out_tokens_bufs = [
-            torch.empty(
-                (new_cap, verify_num_draft_tokens), dtype=torch.int64, device=device
-            )
+            torch.empty((new_cap, num_verify_tokens), dtype=torch.int64, device=device)
             for _ in range(2)
         ]
         self._new_seq_lens_bufs = [
@@ -2339,7 +2348,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
                     positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-                    draft_token_num=int(self.speculative_num_draft_tokens),
+                    draft_token_num=int(self.num_verify_tokens),
                     custom_mask=None,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
@@ -2371,7 +2380,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.speculative_num_draft_tokens),
+                speculative_num_draft_tokens=int(self.num_verify_tokens),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
 
@@ -2399,7 +2408,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "`weight` or a `quant_method` that can produce logits."
             )
 
-        block_size = int(self.block_size)
+        block_size = int(self.draft_block_size)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -2566,13 +2575,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             and draft_out.can_run_graph
         ):
             draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
+                : bs * (int(self.draft_block_size) - 1)
+            ].view(bs, int(self.draft_block_size) - 1)
         elif self._is_domino:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_hidden = draft_hidden.view(bs, int(self.draft_block_size), -1)
             prefix_gru = self.draft_model.prefix_gru
             embed_proj = self.draft_model.embed_proj
             if prefix_gru is None or embed_proj is None:
@@ -2602,8 +2611,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
+                : bs * (int(self.draft_block_size) - 1)
+            ].view(bs, int(self.draft_block_size) - 1)
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
@@ -2653,7 +2662,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
                     propose_lilicorr_block(
                         head=self.lilicorr,
-                        draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
+                        draft_hidden=draft_hidden.view(
+                            bs, int(self.draft_block_size), -1
+                        ),
                         lm_head=lm_head,
                         embed_tokens=target_input_embeddings(
                             self.target_worker.model_runner.model
@@ -2669,25 +2680,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            draft_hidden = draft_hidden.view(bs, int(self.draft_block_size), -1)
             with draft_tp_context(self.draft_owns_attention):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
                     ),
                     lm_head=lm_head,
-                ).view(bs, int(self.block_size) - 1)
+                ).view(bs, int(self.draft_block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
         # The target scores only the leading verify window of the drafted block.
-        verify_num_draft_tokens = int(self.speculative_num_draft_tokens)
-        candidates = draft_tokens[:, :verify_num_draft_tokens].contiguous()
-        verify_positions = positions_2d[:, :verify_num_draft_tokens].reshape(-1)
+        num_verify_tokens = int(self.num_verify_tokens)
+        candidates = draft_tokens[:, :num_verify_tokens].contiguous()
+        verify_positions = positions_2d[:, :num_verify_tokens].reshape(-1)
         verify_cache_loc_2d = verify_out_cache_loc_2d[
-            :, :verify_num_draft_tokens
+            :, :num_verify_tokens
         ].contiguous()
         verify_cache_loc = verify_cache_loc_2d.reshape(-1)
 
@@ -2703,7 +2714,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_input = DFlashVerifyInput(
             draft_token=candidates.reshape(-1),
             positions=verify_positions,
-            draft_token_num=verify_num_draft_tokens,
+            draft_token_num=num_verify_tokens,
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -2718,7 +2729,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
             # Verify host bound = committed prefix + one verify window.
-            verify_host_seq_lens = seq_lens_cpu_backup + verify_num_draft_tokens
+            verify_host_seq_lens = seq_lens_cpu_backup + num_verify_tokens
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
@@ -2771,7 +2782,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=verify_num_draft_tokens,
+                draft_token_num=num_verify_tokens,
             )
 
         # Constrain every chain position before accept picks from it.
@@ -2806,7 +2817,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # The sampling-verify branch does not materialize the target argmax.
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
-                ).view(bs, verify_num_draft_tokens)
+                ).view(bs, num_verify_tokens)
             apply_dflash_simulated_acceptance(
                 candidates=candidates,
                 target_predict=target_predict,
@@ -2826,7 +2837,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
             draft_input=draft_input,
-            draft_token_num=verify_num_draft_tokens,
+            draft_token_num=num_verify_tokens,
             bs=bs,
         )
         if sampling_mask_capture is not None:
@@ -2840,7 +2851,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                chain_stride=verify_num_draft_tokens,
+                chain_stride=num_verify_tokens,
             )
 
         if self._need_mamba_verify_commit:
@@ -2865,7 +2876,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, verify_num_draft_tokens, -1)
+        hidden = hidden.view(bs, num_verify_tokens, -1)
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
@@ -2891,7 +2902,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=int(self.speculative_num_draft_tokens),
+            speculative_num_draft_tokens=int(self.num_verify_tokens),
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
