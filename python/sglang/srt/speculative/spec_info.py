@@ -275,10 +275,7 @@ class SpeculativeAlgorithm(Enum):
             return None
         if self.is_dflash():
             # The draft fills its whole block even when verify is narrower.
-            return max(
-                int(cfg.speculative_num_draft_tokens),
-                int(cfg.speculative_dflash_block_size or 0),
-            )
+            return cfg.speculative_dflash_block_size or cfg.speculative_num_draft_tokens
         if not cfg.speculative_adaptive:
             return cfg.speculative_num_draft_tokens
 
