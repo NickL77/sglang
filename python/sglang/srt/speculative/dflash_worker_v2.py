@@ -487,7 +487,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         self.draft_model.set_block_size(self.draft_block_size)
         # The target verifies only the leading tokens of each drafted block.
-        self.num_verify_tokens = int(get_spec().speculative_num_draft_tokens)
+        self.num_verify_tokens = int(get_spec().speculative_dflash_num_verify_tokens)
         if self._is_domino and self.draft_block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires --speculative-dflash-block-size > 1, "

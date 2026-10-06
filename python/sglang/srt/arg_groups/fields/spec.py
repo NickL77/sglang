@@ -68,8 +68,12 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
+        "DFLASH only. Draft block size (tokens the draft model proposes per step). Alias of --speculative-num-draft-tokens for DFLASH; defaults to the draft checkpoint's block_size.",
+    ] = None
+    speculative_dflash_num_verify_tokens: A[
+        Optional[int],
         Arg(
-            help="DFLASH only. Draft block size (tokens the draft model proposes per step). Defaults to --speculative-num-draft-tokens, else the draft checkpoint's block_size. When larger than --speculative-num-draft-tokens, the target verifies only the leading --speculative-num-draft-tokens tokens of each drafted block.",
+            help="DFLASH only. Number of leading tokens of each drafted block the target verifies. Defaults to the full block (--speculative-dflash-block-size). Set it lower to skip verifying the block's tail; the draft model still proposes the full block.",
             resolvable=True,
         ),
     ] = None

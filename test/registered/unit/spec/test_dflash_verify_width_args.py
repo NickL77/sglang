@@ -42,7 +42,7 @@ class TestDFlashVerifyWidthArgs(CustomTestCase):
             resolution_result(args, "speculative_num_draft_tokens"),
         )
 
-    def test_one_knob_sets_both_widths(self):
+    def test_block_size_knobs_set_both_widths(self):
         cases = (
             ({}, (16, 16)),
             ({"speculative_num_draft_tokens": 8}, (8, 8)),
@@ -56,31 +56,40 @@ class TestDFlashVerifyWidthArgs(CustomTestCase):
             with self.subTest(fields=fields):
                 self.assertEqual(self._widths(self._resolve(**fields)), expected)
 
+    def test_mismatched_block_size_knobs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must match"):
+            self._resolve(
+                speculative_dflash_block_size=16, speculative_num_draft_tokens=8
+            )
+
     def test_verify_width_may_be_narrower_than_the_draft_block(self):
         args = self._resolve(
-            speculative_dflash_block_size=16, speculative_num_draft_tokens=8
+            speculative_dflash_block_size=16, speculative_dflash_num_verify_tokens=8
         )
         self.assertEqual(self._widths(args), (16, 8))
+        self.assertEqual(
+            resolution_result(args, "speculative_dflash_num_verify_tokens"), 8
+        )
         # KV is reserved for the whole drafted block, not just the verified head.
         self.assertEqual(
             SpeculativeAlgorithm.DFLASH.resolve_max_speculative_num_draft_tokens(args),
             16,
         )
 
-    def test_verify_width_above_the_draft_block_is_rejected(self):
+    def test_verify_width_outside_the_draft_block_is_rejected(self):
         for verify_width in (0, 17):
             with self.subTest(verify_width=verify_width):
-                with self.assertRaisesRegex(ValueError, "verify width"):
+                with self.assertRaisesRegex(ValueError, "num-verify-tokens"):
                     self._resolve(
                         speculative_dflash_block_size=16,
-                        speculative_num_draft_tokens=verify_width,
+                        speculative_dflash_num_verify_tokens=verify_width,
                     )
 
     def test_draft_window_is_checked_against_the_draft_block(self):
         with self.assertRaisesRegex(ValueError, "speculative-draft-window-size"):
             self._resolve(
                 speculative_dflash_block_size=16,
-                speculative_num_draft_tokens=8,
+                speculative_dflash_num_verify_tokens=8,
                 speculative_draft_window_size=12,
             )
 
@@ -89,6 +98,7 @@ class TestDFlashVerifyWidthArgs(CustomTestCase):
             speculative_algorithm="DFLASH",
             speculative_draft_model_path="draft",
             speculative_dflash_block_size=16,
+            speculative_dflash_num_verify_tokens=8,
             speculative_num_draft_tokens=8,
         )
         override.install()

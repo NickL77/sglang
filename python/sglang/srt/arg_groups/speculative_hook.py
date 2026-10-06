@@ -377,12 +377,20 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_eagle_topk=1,
         )
 
-    # The draft block is the width the checkpoint was trained to fill; the
-    # target verifies only the leading `speculative_num_draft_tokens` of it,
-    # so a block whose tail rarely survives verify need not be scored in full.
+    # --speculative-dflash-block-size and --speculative-num-draft-tokens both
+    # name the draft block (the width the checkpoint was trained to fill).
     draft_block_size = cfg.speculative_dflash_block_size
     if draft_block_size is None:
         draft_block_size = cfg.speculative_num_draft_tokens
+    elif cfg.speculative_num_draft_tokens is not None and int(
+        cfg.speculative_num_draft_tokens
+    ) != int(draft_block_size):
+        raise ValueError(
+            "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+            "but they differ. For DFLASH they must match. "
+            f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}, "
+            f"speculative_dflash_block_size={draft_block_size}."
+        )
     if draft_block_size is None:
         draft_block_size = _infer_dflash_block_size(cfg)
     draft_block_size = int(draft_block_size)
@@ -391,22 +399,27 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH requires --speculative-dflash-block-size to be positive, "
             f"got {draft_block_size}."
         )
+
+    # The target may verify only the leading tokens of each drafted block, so a
+    # block whose tail rarely survives verify need not be scored in full.
     num_verify_tokens = (
         draft_block_size
-        if cfg.speculative_num_draft_tokens is None
-        else int(cfg.speculative_num_draft_tokens)
+        if cfg.speculative_dflash_num_verify_tokens is None
+        else int(cfg.speculative_dflash_num_verify_tokens)
     )
     if not 1 <= num_verify_tokens <= draft_block_size:
         raise ValueError(
-            "DFLASH requires 1 <= --speculative-num-draft-tokens (verify width) "
-            "<= --speculative-dflash-block-size (draft block size). "
-            f"speculative_num_draft_tokens={num_verify_tokens}, "
+            "DFLASH requires 1 <= --speculative-dflash-num-verify-tokens "
+            "<= --speculative-dflash-block-size. "
+            f"speculative_dflash_num_verify_tokens={num_verify_tokens}, "
             f"speculative_dflash_block_size={draft_block_size}."
         )
     declare_resolution(
         server_args,
         "_handle_dflash",
         speculative_dflash_block_size=draft_block_size,
+        speculative_dflash_num_verify_tokens=num_verify_tokens,
+        # Target-side consumers read the verify width through this field.
         speculative_num_draft_tokens=num_verify_tokens,
     )
 
