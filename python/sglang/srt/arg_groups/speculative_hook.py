@@ -271,6 +271,39 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
+def _infer_dflash_block_size(cfg) -> int:
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+    model_override_args = json.loads(cfg.json_model_override_args)
+    inferred_block_size = None
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=model_override_args,
+        )
+        inferred_block_size = parse_dflash_draft_config(
+            draft_hf_config=draft_hf_config
+        ).resolve_block_size(default=None)
+    except Exception as e:
+        logger.warning(
+            "Failed to infer DFLASH block_size from draft model config; "
+            "defaulting speculative_dflash_block_size to 16. Error: %s",
+            e,
+        )
+
+    if inferred_block_size is None:
+        inferred_block_size = 16
+        logger.warning(
+            "speculative_dflash_block_size is not set; defaulting to %d for DFLASH.",
+            inferred_block_size,
+        )
+    return int(inferred_block_size)
+
+
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
@@ -343,72 +376,45 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             speculative_eagle_topk=1,
         )
 
-    if cfg.speculative_dflash_block_size is not None:
-        if int(cfg.speculative_dflash_block_size) <= 0:
-            raise ValueError(
-                "DFLASH requires --speculative-dflash-block-size to be positive, "
-                f"got {cfg.speculative_dflash_block_size}."
-            )
-        if cfg.speculative_num_draft_tokens is not None and int(
-            cfg.speculative_num_draft_tokens
-        ) != int(cfg.speculative_dflash_block_size):
-            raise ValueError(
-                "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                "but they differ. For DFLASH they must match. "
-                f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}, "
-                f"speculative_dflash_block_size={cfg.speculative_dflash_block_size}."
-            )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_draft_tokens=int(cfg.speculative_dflash_block_size),
+    # The draft block is the width the checkpoint was trained to fill; the
+    # target verifies only the leading `speculative_num_draft_tokens` of it,
+    # so a block whose tail rarely survives verify need not be scored in full.
+    block_size = cfg.speculative_dflash_block_size
+    if block_size is None:
+        block_size = cfg.speculative_num_draft_tokens
+    if block_size is None:
+        block_size = _infer_dflash_block_size(cfg)
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError(
+            "DFLASH requires --speculative-dflash-block-size to be positive, "
+            f"got {block_size}."
         )
-
-    if cfg.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dflash_utils import (
-            parse_dflash_draft_config,
+    verify_num_draft_tokens = (
+        block_size
+        if cfg.speculative_num_draft_tokens is None
+        else int(cfg.speculative_num_draft_tokens)
+    )
+    if not 1 <= verify_num_draft_tokens <= block_size:
+        raise ValueError(
+            "DFLASH requires 1 <= --speculative-num-draft-tokens (verify width) "
+            "<= --speculative-dflash-block-size (draft block size). "
+            f"speculative_num_draft_tokens={verify_num_draft_tokens}, "
+            f"speculative_dflash_block_size={block_size}."
         )
-
-        model_override_args = json.loads(cfg.json_model_override_args)
-        inferred_block_size = None
-        try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            inferred_block_size = parse_dflash_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_block_size(default=None)
-        except Exception as e:
-            logger.warning(
-                "Failed to infer DFLASH block_size from draft model config; "
-                "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                e,
-            )
-
-        if inferred_block_size is None:
-            inferred_block_size = 16
-            logger.warning(
-                "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                inferred_block_size,
-            )
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            speculative_num_draft_tokens=inferred_block_size,
-        )
+    declare_resolution(
+        server_args,
+        "_handle_dflash",
+        speculative_dflash_block_size=block_size,
+        speculative_num_draft_tokens=verify_num_draft_tokens,
+    )
 
     if cfg.speculative_draft_window_size is not None:
-        draft_tokens = int(cfg.speculative_num_draft_tokens)
-        if cfg.speculative_draft_window_size < draft_tokens:
+        if cfg.speculative_draft_window_size < block_size:
             raise ValueError(
                 "--speculative-draft-window-size must be >= "
-                "--speculative-num-draft-tokens (block_size). "
-                f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
+                "--speculative-dflash-block-size. "
+                f"window_size={cfg.speculative_draft_window_size}, block_size={block_size}."
             )
 
     _resolve_dflash_draft_attention_backend(server_args)

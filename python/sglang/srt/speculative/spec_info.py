@@ -273,6 +273,12 @@ class SpeculativeAlgorithm(Enum):
         cfg = resolving_view(server_args)
         if cfg.speculative_num_draft_tokens is None:
             return None
+        if self.is_dflash():
+            # The draft fills its whole block even when verify is narrower.
+            return max(
+                int(cfg.speculative_num_draft_tokens),
+                int(cfg.speculative_dflash_block_size or 0),
+            )
         if not cfg.speculative_adaptive:
             return cfg.speculative_num_draft_tokens
 
@@ -297,6 +303,8 @@ class SpeculativeAlgorithm(Enum):
         # Here, we expose this interface to allow the other use cases.
         if self.is_dspark() and is_draft_worker:
             return num_draft_tokens - 1
+        if self.is_dflash() and is_draft_worker:
+            return get_spec_config().speculative_dflash_block_size or num_draft_tokens
         return num_draft_tokens
 
     def create_worker(

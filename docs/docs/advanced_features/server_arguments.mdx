@@ -1656,7 +1656,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
       <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--speculative-dflash-block-size`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DFLASH only. Draft block size (tokens the draft model proposes per step). Defaults to --speculative-num-draft-tokens, else the draft checkpoint's block_size. When larger than --speculative-num-draft-tokens, the target verifies only the leading --speculative-num-draft-tokens tokens of each drafted block.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>

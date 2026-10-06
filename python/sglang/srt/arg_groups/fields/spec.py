@@ -68,7 +68,10 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        Arg(
+            help="DFLASH only. Draft block size (tokens the draft model proposes per step). Defaults to --speculative-num-draft-tokens, else the draft checkpoint's block_size. When larger than --speculative-num-draft-tokens, the target verifies only the leading --speculative-num-draft-tokens tokens of each drafted block.",
+            resolvable=True,
+        ),
     ] = None
     speculative_domino_candidate_pool_size: A[
         int,
