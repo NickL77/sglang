@@ -841,7 +841,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         re-measure, rather than crash startup or leave KV sizing without the
         headroom it now has to reserve."""
         worker = object.__new__(DFlashWorkerV2)
-        worker.block_size = 4
+        worker.num_verify_tokens = 4
         worker.device = "cuda"
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
