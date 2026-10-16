@@ -246,7 +246,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         quant_method=_FakeQuantMethod(torch.randn(6, 4), num_padded=2),
     )
     worker = SimpleNamespace(
-        block_size=8,
+        draft_block_size=8,
         selector=object(),
         _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
@@ -314,7 +314,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     worker = SimpleNamespace(
         draft_model=draft_model,
         selector=selector,
-        block_size=2,
+        draft_block_size=2,
         _selector_sampling_enabled=False,
         _selector_sample=None,
     )
@@ -360,7 +360,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,
-        block_size=2,
+        draft_block_size=2,
     )
 
     result = worker_mod.DFlashWorkerV2._accept_block(

@@ -167,6 +167,15 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
     other_launch_args = ["--disable-cuda-graph"]
 
 
+class TestDFlashServerNarrowVerify(TestDFlashServerBase):
+    """Draft the checkpoint's full block (10 for the UltraChat draft) but let
+    the target verify only its first 5 tokens."""
+
+    other_launch_args = ["--speculative-dflash-num-verify-tokens", "5"]
+    # Measured 3.43 on H100 (GSM8K, 1319 greedy); 4.04 for the full block.
+    gsm8k_accept_length_thres = 3.0
+
+
 class TestDFlashServerOverlap(TestDFlashServerBase):
     disable_overlap = False
 

@@ -138,11 +138,11 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
-        # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_spec().speculative_num_draft_tokens)
+        # For DFLASH, each decode step drafts a fixed-size block.
+        block_size = int(get_spec().speculative_dflash_block_size)
         if block_size <= 0:
             raise ValueError(
-                f"DFLASH invalid speculative_num_draft_tokens={block_size}."
+                f"DFLASH invalid speculative_dflash_block_size={block_size}."
             )
         reserve = 2 * block_size
         page_size = batch.token_to_kv_pool_allocator.page_size
