@@ -237,6 +237,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_symm_mem",
     "triton_attention_num_kv_splits",
     "triton_attention_split_tile_size",
+    "bidir_state_attention_kernel",
     "flashinfer_mla_disable_ragged",
     "enable_fused_qk_norm_rope",
     "enable_precise_embedding_interpolation",
