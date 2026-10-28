@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -116,6 +117,32 @@ def logit_capping_mod(logit_capping_method, logit_cap):
 
 
 @dataclass
+class BidirSplit:
+    """Token-index plan for one extend batch with block-bidirectional requests.
+
+    State rows (the state block of a request whose extend contains it) attend to the
+    whole state block only; everything else (question rows, cached-state requests,
+    plain causal requests) attends causally to its prefix + itself.
+    """
+
+    state_idx: torch.Tensor  # int64 token indices into the extend batch
+    state_cu_seqlens: torch.Tensor  # int32 [n_state_reqs + 1]
+    state_max_len: int
+    rest_idx: Optional[
+        torch.Tensor
+    ]  # int64 token indices, None if every row is a state row
+    rest_qo_indptr: Optional[
+        torch.Tensor
+    ]  # int32 [bs + 1] (zero-length rows for state-only requests)
+    rest_kv_indptr: Optional[torch.Tensor]  # int32 [bs + 1]
+    rest_kv_indices: Optional[
+        torch.Tensor
+    ]  # KV locations of [0, prefix + state_rows) per request
+    rest_max_len: int
+    rest_seq_lens_cpu: Optional[List[int]]
+
+
+@dataclass
 class ForwardMetadata:
     attn_logits: torch.Tensor
     attn_lse: torch.Tensor
@@ -147,6 +174,8 @@ class ForwardMetadata:
     uneven_batch: Optional[torch.Tensor] = None
     # Per-sequence block-bidirectional boundary (int32, -1 = causal), extend only
     block_boundaries: Optional[torch.Tensor] = None
+    # Split plan for block-bidirectional extends (state rows -> dense kernel, question rows -> extend kernel)
+    bidir_split: Optional[BidirSplit] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -220,6 +249,8 @@ class TritonAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.bidir_state_kernel = get_exec().kernel.bidir_state_attention_kernel
+        self.bidir_split_enabled = self.bidir_state_kernel != "triton"
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
         # Lets the Triton wrappers specialize on PAGE_SIZE; page_size=1 is
@@ -1135,12 +1166,18 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         block_boundaries = None
+        bidir_split = None
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.bidir_prefix_lens is not None
         ):
             block_boundaries = torch.tensor(
                 forward_batch.bidir_prefix_lens, dtype=torch.int32, device=self.device
+            )
+            bidir_split = (
+                self._plan_bidir_split(forward_batch)
+                if self.bidir_split_enabled and spec_info is None
+                else None
             )
 
         self.forward_metadata = ForwardMetadata(
@@ -1167,6 +1204,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=lean_locks,
             uneven_batch=uneven_batch,
             block_boundaries=block_boundaries,
+            bidir_split=bidir_split,
         )
 
     def init_cuda_graph_state(
@@ -1897,6 +1935,16 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        if (
+            self.forward_metadata.bidir_split is not None
+            and sliding_window_size == -1
+            and score_mod is None
+            and aux_tensors is None
+            and sinks is None
+        ):
+            return self._forward_extend_bidir_split(
+                layer, q, k, v, o, k_descale, v_descale, logits_soft_cap
+            )
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1925,6 +1973,140 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
+        return o
+
+    def _plan_bidir_split(self, forward_batch: ForwardBatch) -> Optional[BidirSplit]:
+        bounds = forward_batch.bidir_prefix_lens
+        prefix = forward_batch.extend_prefix_lens_cpu
+        ext = forward_batch.extend_seq_lens_cpu
+        if prefix is None or ext is None:
+            return None
+        seq = [p + e for p, e in zip(prefix, ext)]
+        s_idx, s_len, r_idx, r_len, r_keys = [], [], [], [], []
+        off = 0
+        for b, p, e, L in zip(bounds, prefix, ext, seq):
+            n_state = max(0, min(b, L) - p) if b is not None and b > 0 else 0
+            if n_state:
+                s_idx.extend(range(off, off + n_state))
+                s_len.append(n_state)
+            r_idx.extend(range(off + n_state, off + e))
+            r_len.append(e - n_state)
+            r_keys.append(p + n_state)
+            off += e
+        if not s_len:
+            return None
+        dev = self.device
+        i32 = dict(dtype=torch.int32, device=dev)
+        plan = BidirSplit(
+            state_idx=torch.tensor(s_idx, dtype=torch.int64, device=dev),
+            state_cu_seqlens=torch.tensor(
+                [0] + list(itertools.accumulate(s_len)), **i32
+            ),
+            state_max_len=max(s_len),
+            rest_idx=None,
+            rest_qo_indptr=None,
+            rest_kv_indptr=None,
+            rest_kv_indices=None,
+            rest_max_len=0,
+            rest_seq_lens_cpu=None,
+        )
+        if r_idx:
+            bs = len(r_len)
+            req_pool = forward_batch.req_pool_indices[:bs].tolist()
+            kv_rows = [
+                self.req_to_token[r, :n] for r, n in zip(req_pool, r_keys) if n > 0
+            ]
+            plan.rest_idx = torch.tensor(r_idx, dtype=torch.int64, device=dev)
+            plan.rest_qo_indptr = torch.tensor(
+                [0] + list(itertools.accumulate(r_len)), **i32
+            )
+            plan.rest_kv_indptr = torch.tensor(
+                [0] + list(itertools.accumulate(r_keys)), **i32
+            )
+            plan.rest_kv_indices = (
+                torch.cat(kv_rows)
+                if kv_rows
+                else torch.empty(0, dtype=self.req_to_token.dtype, device=dev)
+            )
+            plan.rest_max_len = max(r_len)
+            plan.rest_seq_lens_cpu = r_len
+        return plan
+
+    def _forward_extend_bidir_split(
+        self, layer, q, k, v, o, k_descale, v_descale, logits_soft_cap
+    ):
+        from sglang.kernels.ops.attention.flash_attention_v4 import (
+            flash_attn_varlen_func,
+        )
+
+        plan = self.forward_metadata.bidir_split
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k3 = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v3 = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        qs, ks, vs = q3[plan.state_idx], k3[plan.state_idx], v3[plan.state_idx]
+        if self.bidir_state_kernel == "cudnn":
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            o_state = torch.empty_like(qs)
+            bounds = plan.state_cu_seqlens.tolist()
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                for lo, hi in zip(bounds[:-1], bounds[1:]):
+                    o_state[lo:hi] = torch.nn.functional.scaled_dot_product_attention(
+                        qs[lo:hi].permute(1, 0, 2)[None],
+                        ks[lo:hi].permute(1, 0, 2)[None],
+                        vs[lo:hi].permute(1, 0, 2)[None],
+                        is_causal=False,
+                        scale=layer.scaling,
+                        enable_gqa=True,
+                    )[0].permute(1, 0, 2)
+        else:
+            o_state = flash_attn_varlen_func(
+                qs,
+                ks,
+                vs,
+                cu_seqlens_q=plan.state_cu_seqlens,
+                cu_seqlens_k=plan.state_cu_seqlens,
+                max_seqlen_q=plan.state_max_len,
+                max_seqlen_k=plan.state_max_len,
+                causal=False,
+                softmax_scale=layer.scaling,
+                softcap=logits_soft_cap if logits_soft_cap else None,
+            )
+            if isinstance(o_state, tuple):
+                o_state = o_state[0]
+        o3.index_copy_(0, plan.state_idx, o_state.to(o3.dtype))
+        if plan.rest_idx is not None:
+            o_rest = torch.empty(
+                (plan.rest_idx.numel(), layer.tp_q_head_num, layer.v_head_dim),
+                dtype=o3.dtype,
+                device=o3.device,
+            )
+            self.extend_attention_fwd(
+                q3[plan.rest_idx],
+                k3[plan.rest_idx],
+                v3[plan.rest_idx],
+                o_rest,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                plan.rest_qo_indptr,
+                plan.rest_kv_indptr,
+                plan.rest_kv_indices,
+                None,
+                True,
+                None,
+                plan.rest_max_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                page_size=self.page_size,
+                extend_seq_lens_cpu=plan.rest_seq_lens_cpu,
+                # question rows see the whole state and the whole question block
+                block_boundaries=self.forward_metadata.block_boundaries,
+            )
+            o3.index_copy_(0, plan.rest_idx, o_rest)
         return o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
