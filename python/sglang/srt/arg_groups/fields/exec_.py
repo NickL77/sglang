@@ -384,6 +384,17 @@ class ExecKernel(msgspec.Struct):
         Optional[int],
         "The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference.",
     ] = None
+    bidir_state_attention_kernel: A[
+        str,
+        Arg(
+            help="Attention kernel for the state rows of block-bidirectional "
+            "(bidir_prefix_len) extends on the Triton backend. 'triton' keeps the "
+            "block-masked extend kernel for every row; 'fa4' (Blackwell) or 'cudnn' "
+            "run the state block as one dense non-causal attention and leave the "
+            "question rows on the extend kernel.",
+            choices=["triton", "fa4", "cudnn"],
+        ),
+    ] = "triton"
     flashinfer_mla_disable_ragged: A[
         bool, "Not using ragged prefill wrapper when running flashinfer mla"
     ] = False
