@@ -242,6 +242,7 @@ POSITIONAL_FIELD_ORDER = (
     "triton_attention_reduce_in_fp32",
     "triton_attention_num_kv_splits",
     "triton_attention_split_tile_size",
+    "bidir_state_attention_kernel",
     "flashinfer_mla_disable_ragged",
     "enable_fused_qk_norm_rope",
     "enable_precise_embedding_interpolation",
