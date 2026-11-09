@@ -1603,8 +1603,6 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     time_stats: Optional[PickleWrapper] = None
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
-    # Block-bidirectional attention boundary; -1 = causal.
-    bidir_prefix_len: int = -1
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

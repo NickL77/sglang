@@ -1849,7 +1849,7 @@ class TestBidirStateBlockCheckpoint(
 
     def _finish(self, bidir_prefix_len):
         cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
-        req, tokens = self._build_req(allocator, pool, None)
+        req, _ = self._build_req(allocator, pool, None)
         tokens = list(range(self.PROMPT_LEN))
         req.origin_input_ids = array("q", tokens)
         req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
