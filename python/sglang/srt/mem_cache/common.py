@@ -254,6 +254,13 @@ def match_kv_cache(
                 # Drop the copy-on-write of the matched mamba state.
                 req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = True
+        elif 0 < req.bidir_prefix_len <= state_hit and req.bidir_prefix_len < len(
+            token_ids
+        ):
+            # The state block is already cached and nothing can match past it, so
+            # inserting this question's KV and end state would only evict state
+            # blocks that later questions reuse.
+            req.skip_radix_cache_insert = True
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,
@@ -279,6 +286,37 @@ def match_kv_cache(
     if match_result.cache_protected_len is not None:
         req.kv.cache_protected_len = match_result.cache_protected_len
     return match_result
+
+
+def bidir_state_block_cached(req: Req, tree_cache: BasePrefixCache) -> bool:
+    """Whether a state-only block-bidirectional prefill has nothing to compute.
+
+    match_kv_cache leaves every request one token to forward, so a state-only
+    request can never reach its full-block hit and would recompute the block.
+    Look the whole block up instead.
+    """
+    state_len = len(req.origin_input_ids)
+    if (
+        not 0 < state_len == req.bidir_prefix_len
+        or not req.is_prefill_only
+        or req.return_logprob
+        or req.return_hidden_states
+        or envs.SGLANG_RADIX_FORCE_MISS.get()
+    ):
+        return False
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(
+                token_ids=req.origin_input_ids,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+            )
+        )
+    )
+    # A hybrid cache reports the last recurrent checkpoint as the device prefix;
+    # the state block is reusable once all of its KV is cached.
+    state_hit = match_result.full_kv_hit_length or match_result.device_prefix_len
+    return state_hit == state_len
 
 
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
