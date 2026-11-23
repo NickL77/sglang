@@ -249,6 +249,37 @@ def match_kv_cache(
     return match_result
 
 
+def bidir_state_block_cached(req: Req, tree_cache: BasePrefixCache) -> bool:
+    """Whether a state-only block-bidirectional prefill has nothing to compute.
+
+    match_kv_cache leaves every request one token to forward, so a state-only
+    request can never reach its full-block hit and would recompute the block.
+    Look the whole block up instead.
+    """
+    state_len = len(req.origin_input_ids)
+    if (
+        not 0 < state_len == req.bidir_prefix_len
+        or not req.is_prefill_only
+        or req.return_logprob
+        or req.return_hidden_states
+        or envs.SGLANG_RADIX_FORCE_MISS.get()
+    ):
+        return False
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(
+                token_ids=req.origin_input_ids,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+            )
+        )
+    )
+    # A hybrid cache reports the last recurrent checkpoint as the device prefix;
+    # the state block is reusable once all of its KV is cached.
+    state_hit = match_result.full_kv_hit_length or match_result.device_prefix_len
+    return state_hit == state_len
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Publish what the running request has computed so far, unless it is
     barred from the tree."""

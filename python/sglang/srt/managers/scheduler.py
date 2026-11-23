@@ -241,6 +241,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.req_types import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -349,7 +350,11 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.capacity import shares_memory
-from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
+from sglang.srt.mem_cache.common import (
+    bidir_state_block_cached,
+    checkpoint_kv_cache,
+    storage_prefetch_end,
+)
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
@@ -3734,6 +3739,14 @@ class Scheduler(
                 return
 
         self._bind_pp_arrival_prefetch(req, recv_req)
+
+        if bidir_state_block_cached(req, self.tree_cache):
+            # The state block is already cached for the questions that follow.
+            req.cached_tokens = req.cached_tokens_device = len(req.origin_input_ids)
+            req.finish_outside_step(FINISH_LENGTH(length=0))
+            self.request_retirer.release(req, checkpoint=False)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
 
         # Expected here too: the grammar queue holds it before it is queued.
         self.invariant_checker.expect_output(req)
