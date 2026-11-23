@@ -251,7 +251,9 @@ class TestBidirStateBlockCached(unittest.TestCase):
         # A hybrid cache reports the last recurrent checkpoint as the device prefix.
         tree = self._tree()
         req = self._state_req(range(10, 18))
-        full = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=array("q", range(10, 18)))))
+        full = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=array("q", range(10, 18))))
+        )
         tree.match_prefix = lambda params: full._replace(
             device_prefix_len=4, full_kv_hit_length=8
         )
