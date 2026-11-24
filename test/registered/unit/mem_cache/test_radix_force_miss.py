@@ -137,16 +137,18 @@ class TestBidirQuestionInsert(unittest.TestCase):
         req.bidir_prefix_len = 8
         return req
 
-    def test_question_on_cached_state_is_not_inserted(self):
-        req = self._question(list(range(10, 18)) + [99, 100])
-        match_kv_cache(req, self._tree())
-        self.assertTrue(req.skip_radix_cache_insert)
+    def test_question_is_never_inserted(self):
+        for state in (range(10, 18), range(20, 28), list(range(10, 17)) + [50]):
+            req = self._question(list(state) + [99, 100])
+            match_kv_cache(req, self._tree())
+            self.assertTrue(req.skip_radix_cache_insert)
 
-    def test_uncached_question_is_still_inserted(self):
-        # The finished request is what caches its state block.
-        req = self._question(list(range(20, 28)) + [99, 100])
-        match_kv_cache(req, self._tree())
-        self.assertFalse(req.skip_radix_cache_insert)
+    def test_request_without_a_state_block_is_still_inserted(self):
+        for bidir_prefix_len in (-1, 0):
+            req = self._question(list(range(10, 18)) + [99, 100])
+            req.bidir_prefix_len = bidir_prefix_len
+            match_kv_cache(req, self._tree())
+            self.assertFalse(req.skip_radix_cache_insert)
 
     def test_state_only_request_is_still_inserted(self):
         req = self._question(range(10, 18))
