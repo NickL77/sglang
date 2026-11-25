@@ -210,6 +210,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     MultimodalInputs,
     MultimodalProcessorOutput,
     NextBatchPlan,
@@ -294,6 +295,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    bidir_state_block_cached,
     checkpoint_kv_cache,
     discard_kv_cache_backup,
     release_kv_cache,
@@ -3260,6 +3262,13 @@ class Scheduler(
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+
+        if bidir_state_block_cached(req, self.tree_cache):
+            # The state block is already cached for the questions that follow.
+            req.cached_tokens = req.cached_tokens_device = len(req.origin_input_ids)
+            req.finished_reason = FINISH_LENGTH(length=0)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
