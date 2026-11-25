@@ -215,6 +215,13 @@ def match_kv_cache(
             req.kv.mamba_cow_src_index = None
             if req.kv.holds_mamba:
                 req.kv.mamba_needs_clear = True
+        elif 0 < req.bidir_prefix_len <= state_hit and req.bidir_prefix_len < len(
+            token_ids
+        ):
+            # The state block is already cached and nothing can match past it, so
+            # inserting this question's KV and end state would only evict state
+            # blocks that later questions reuse.
+            req.skip_radix_cache_insert = True
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,

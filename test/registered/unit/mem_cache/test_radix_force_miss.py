@@ -39,6 +39,7 @@ class _StubReq:
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
         self.bidir_prefix_len = -1
+        self.skip_radix_cache_insert = False
         self.kv = SimpleNamespace(cache_protected_len=None, holds_mamba=False)
 
     def _compute_max_prefix_len(self, input_len):
@@ -169,6 +170,34 @@ class TestMatchKvCacheBidirPartialState(CustomTestCase):
 
         self.assertEqual(req.prefix_len, 8)
         self.assertIsNot(req.last_node, tree.root_node)
+
+    def test_question_on_cached_state_is_not_inserted(self):
+        tree = self._tree()
+        req = _StubReq(list(range(10, 18)) + [99, 100])
+        req.bidir_prefix_len = 8
+
+        match_kv_cache(req, tree)
+
+        self.assertTrue(req.skip_radix_cache_insert)
+
+    def test_uncached_question_is_still_inserted(self):
+        tree = self._tree()
+        req = _StubReq(list(range(20, 28)) + [99, 100])
+        req.bidir_prefix_len = 8
+
+        match_kv_cache(req, tree)
+
+        # The finished request is what caches its state block.
+        self.assertFalse(req.skip_radix_cache_insert)
+
+    def test_state_only_request_is_still_inserted(self):
+        tree = self._tree()
+        req = _StubReq(list(range(10, 18)))
+        req.bidir_prefix_len = 8
+
+        match_kv_cache(req, tree)
+
+        self.assertFalse(req.skip_radix_cache_insert)
 
 
 if __name__ == "__main__":
